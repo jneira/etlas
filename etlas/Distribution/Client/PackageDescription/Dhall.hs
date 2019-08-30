@@ -1,29 +1,19 @@
 {-# LANGUAGE CPP, RecordWildCards, OverloadedStrings #-}
 module Distribution.Client.PackageDescription.Dhall where
 
-import Control.Exception ( throwIO, catch, SomeException )
-import qualified Control.Monad.Trans.State.Strict as State
-
-import qualified Crypto.Hash
+import Control.Exception ( throwIO )
 
 import Data.Function ( (&) )
-import qualified Data.Hashable as Hashable
 import Data.Maybe ( fromMaybe )
-import Data.Semigroup ( (<>) )
 
 import qualified Data.Text as StrictText
 import qualified Data.Text.IO as StrictText
-
-import Data.Word ( Word64 )
 
 import qualified Dhall
 import qualified Dhall.Binary as Dhall
 import qualified Dhall.Core as Dhall
   hiding ( Type )
 import qualified Dhall.Context
-import qualified Dhall.Import as Dhall
-  hiding ( startingContext, standardVersion )
-import qualified Dhall.Import ( standardVersion )
 import qualified Dhall.Parser as Dhall
 import qualified Dhall.TypeCheck as Dhall
 import qualified Dhall.Format as Dhall
@@ -63,25 +53,17 @@ import qualified Lens.Micro as Lens
 import Lens.Micro ( Lens' )
 import qualified Lens.Micro.Extras as Lens
 
-import Numeric (showHex)
-
 import System.CPUTime ( getCPUTime )
-import System.Directory
-       ( createDirectoryIfMissing
-       , doesFileExist
-       , canonicalizePath
-       )
 import System.FilePath
        ( takeDirectory
        , takeExtension
-       , (</>)
        )
                 
 readGenericPackageDescription :: Verbosity -> FilePath
                               -> IO GenericPackageDescription
 readGenericPackageDescription verbosity path =
   if (takeExtension path) == ".dhall" then
-    readFromCache verbosity path
+    readAndParse verbosity path
   else
     Cabal.Parse.readGenericPackageDescription verbosity path
 
@@ -107,155 +89,41 @@ measuringTime verbosity msg action = do
   info verbosity $ msg ++ show (diff :: Double) ++ " seconds"
   return x
   
-
-readFromCache :: Verbosity -> FilePath -> IO GenericPackageDescription
-readFromCache verbosity dhallFilePath  = do
-  fileWithDhallHashPath <- getFileWithDhallHashFilePath dhallFilePath
-  exists <- doesFileExist fileWithDhallHashPath
-
-  let timing = measuringTime verbosity "Configuration readed in "
-  
-  gpd <-
-    if exists then do
-      expectedHash <- StrictText.readFile fileWithDhallHashPath
-
-      let expectedHashStr = StrictText.unpack expectedHash
-
-      info verbosity $ "Reading package configuration from dhall cache using hash: "
-        ++ expectedHashStr ++ " stored in file: " ++ fileWithDhallHashPath
-      
-      let cacheImport = "missing sha256:" <> expectedHash 
-
-      let handler :: SomeException -> IO GenericPackageDescription
-          handler ex = do
-            info verbosity $ "Error while reading cache: " ++ show ex
-            readAndCache verbosity dhallFilePath
-      
-      catch ( timing $ parse dhallFilePath cacheImport ) handler
-
-    else do
-      info verbosity $ "Missing file with dhall cache hash: "
-                     ++ fileWithDhallHashPath
-      readAndCache verbosity dhallFilePath
-
+readAndParse :: Verbosity -> FilePath -> IO GenericPackageDescription
+readAndParse verbosity dhallFilePath = do
   let explaining = if verbosity >= verbose then Dhall.detailed else id
-
-  explaining ( return gpd )
-  
-
-parse :: FilePath -> StrictText.Text -> IO GenericPackageDescription  
-parse dhallFilePath src = do
-  ( _, expr ) <- parseAndHash dhallFilePath src
-
-  extract expr
-
-
-readAndCache :: Verbosity -> FilePath -> IO GenericPackageDescription
-readAndCache verbosity dhallFilePath = do
-  info verbosity $ "Reading and caching package configuration from dhall file: "
+  info verbosity $ "Reading and parsing package configuration from dhall file: "
                 ++ dhallFilePath
   measuringTime verbosity "Configuration readed in " $ do
     src <- StrictText.readFile dhallFilePath
-    parseAndCache dhallFilePath src
+    explaining $ parse dhallFilePath src
 
+parse :: FilePath -> StrictText.Text -> IO GenericPackageDescription
+parse dhallFilePath src = compileDhall dhallFilePath src >>= extract
 
-parseAndCache :: FilePath -> StrictText.Text -> IO GenericPackageDescription 
-parseAndCache dhallFilePath src = do
-  ( hash, normExpr ) <- parseAndHash dhallFilePath src
-  cacheAndExtract hash normExpr dhallFilePath
-
-
-parseAndHash :: FilePath -> StrictText.Text
-             -> IO ( Crypto.Hash.Digest Crypto.Hash.SHA256
-                   , Dhall.Expr Dhall.Src Dhall.X
-                   ) 
-parseAndHash dhallFilePath src = do
+compileDhall :: FilePath -> StrictText.Text -> IO ( Dhall.Expr Dhall.Src Dhall.X ) 
+compileDhall dhallFilePath src = do
   let  settings = Dhall.defaultInputSettings
          & Lens.set Dhall.rootDirectory ( takeDirectory dhallFilePath )
          & Lens.set Dhall.sourceName dhallFilePath
 
   expr  <- Dhall.inputExprWithSettings settings src
 
-  let normExpr = Dhall.alphaNormalize expr
-      hash = Dhall.hashExpression Dhall.defaultStandardVersion normExpr
-
-  return ( hash, normExpr )
-
-
-cacheAndExtract :: Crypto.Hash.Digest Crypto.Hash.SHA256
-                -> Dhall.Expr Dhall.Src Dhall.X
-                -> FilePath
-                -> IO GenericPackageDescription
-cacheAndExtract hash normExpr dhallFilePath = do
-  gpd <- extract normExpr
-
-  writeDhallToCache hash normExpr
-  writeFileWithDhallHash hash dhallFilePath 
-
-  return gpd
+  return $ Dhall.alphaNormalize expr
 
 extract :: Dhall.Expr Dhall.Src Dhall.X -> IO GenericPackageDescription
-extract expr = do                                        
+extract expr = do
   let Dhall.Type {..} = genericPackageDescription
       annot = ( ( Dhall.Annot expr expected )
                 :: Dhall.Expr Dhall.Src Dhall.X )
 
   _ <- throws ( Dhall.typeWith Dhall.Context.empty annot )
 
-  return $ fixGPDConstraints ( fromMaybe
-                               ( error "Empty extracted GenericPackageDescription" )
-                               ( extract expr ) )
+  return $ fixGPDConstraints ( either
+                               ( error . show ) id
+                               ( Dhall.toMonadic ( extract expr ) ) )
 
   where throws = either Control.Exception.throwIO return
-
-
-writeDhallToCache :: Crypto.Hash.Digest Crypto.Hash.SHA256
-                  -> Dhall.Expr Dhall.Src Dhall.X
-                  -> IO ()
-writeDhallToCache hash expr  = do
-  let status =
-        Lens.set
-          Dhall.Import.standardVersion
-          Dhall.defaultStandardVersion (Dhall.emptyStatus ".")
-      newImportHashed =
-        Dhall.ImportHashed
-          { Dhall.hash = Just hash
-          , Dhall.importType = Dhall.Missing
-          }
-      newImport =
-        Dhall.Import
-          { Dhall.importHashed = newImportHashed
-          , Dhall.importMode = Dhall.Code
-          }
-
-  State.evalStateT (Dhall.exprToImport newImport expr) status
-
-
-writeFileWithDhallHash :: Crypto.Hash.Digest Crypto.Hash.SHA256
-                       -> FilePath -> IO ()
-writeFileWithDhallHash hash dhallFilePath = do
-  path <- getFileWithDhallHashFilePath dhallFilePath
-
-  createDirectoryIfMissing True $ takeDirectory path
-  StrictText.writeFile path ( StrictText.pack ( show hash ) )  
-
-
-getFileWithDhallHashFilePath :: FilePath -> IO FilePath 
-getFileWithDhallHashFilePath dhallFilePath = do
-  let cacheDir = takeDirectory dhallFilePath </> "dist" </> "cache"
-
-  hashFileName <- getFileWithDhallHashFileName dhallFilePath
-  return $ cacheDir </> hashFileName
-
-
-getFileWithDhallHashFileName :: FilePath -> IO FilePath
-getFileWithDhallHashFileName dhallFilePath = do
-  canonPath <- canonicalizePath dhallFilePath
-
-  let hash = Hashable.hash canonPath
-
-  return $  showHex ( ( fromIntegral hash ) :: Word64 ) ""
-          
 
 writeDerivedCabalFile :: Verbosity -> FilePath
                       -> GenericPackageDescription -> IO ()
@@ -274,7 +142,8 @@ writeAndFreezeCabalToDhall verbosity path cabal = do
   info verbosity $ "Formatting dhall file..."
   Dhall.format (Dhall.Format Dhall.Unicode ( Dhall.Modify ( Just path ) ))
   info verbosity $ "Freezing dhall file..."
-  Dhall.freeze ( Just path ) True Dhall.Unicode Dhall.defaultStandardVersion 
+  Dhall.freeze ( Just path ) Dhall.AllImports Dhall.Secure Dhall.Unicode
+               Dhall.defaultStandardVersion 
   
 cabalToDhall :: String -> Dhall.Text
 cabalToDhall cabal = Dhall.pretty dhallExpr
